@@ -1,0 +1,564 @@
+---
+title: "HSE195_NSFG_Analysis"
+author: "Isabelle Kressy"
+date: "2025-10-12"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Import libraries
+```{r}
+
+library(haven)
+library(survey)
+library(srvyr)
+library(tidyverse)
+library(knitr)
+library(FactoMineR)
+library(factoextra)
+library(corrplot)
+library(broom)
+library(gt)
+library(prettyunits)
+library(ggplot2)
+library(reshape2)
+library(DescTools)
+
+```
+
+
+Import data
+```{r}
+
+# respondent file
+sas_url_resp <- "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/NSFG/NSFG-2022-2023-FemRespPUFData.sas7bdat"
+nsfg_resp_tbl <- read_sas(sas_url_resp) # read in SAS url file
+nsfg_resp_df <- data.frame(nsfg_resp_tbl) # convert table to data frame
+names(nsfg_resp_df) <- tolower(names(nsfg_resp_df)) # change column names to lowercase
+
+# pregnancy file
+sas_url_preg <- "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/NSFG/NSFG-2022-2023-FemPregPUFData.sas7bdat"
+nsfg_preg_tbl <- read_sas(sas_url_preg) 
+nsfg_preg_df <- data.frame(nsfg_preg_tbl)
+names(nsfg_preg_df) <- tolower(names(nsfg_preg_df))
+
+
+
+```
+
+
+Recoding of variables - current insurance, medical cost, race, smokers 
+```{r}
+
+# recode variables into categories
+nsfg_resp_df <- nsfg_resp_df %>%
+  mutate(curr_ins_cat = factor(curr_ins, levels = c(1,2,3,4),
+                               labels = c("Private", "Public", "Public", "Limited"))) %>%
+  mutate(med_cost_cat = factor(med_cost, levels = c(1,5,8,9),
+                               labels = c("Yes", "No", "Refused", "Don't Know"))) %>%
+  mutate(race_cat = factor(rscrrace, levels = c(1,2,3,4),
+                           labels = c("Other", "Black", "White", "Hispanic"))) %>%
+  mutate(smoke_cat = factor(smk100, levels = c(1,5,8,9),
+                            labels = c("Yes", "No", "Refused", "Don't Know"))) %>%
+  mutate(smoke_curr_cat = factor(asksmoke, levels = c(1,5,8,9),
+                                 labels = c("Yes", "No", "Refused", "Don't Know"))) %>%
+  mutate(poverty_cat = ifelse(poverty <= 200,"Poor", "Stable")) %>%
+  mutate(year_interview = ifelse(year == 1, 2022, 2023))
+
+
+```
+
+
+Setup methods from https://asdfree.com/national-survey-of-family-growth-nsfg.html
+Setup for merged datasets
+```{r}
+
+options(survey.lonely.psu = "adjust") 
+
+# merge dataframes 
+merge_all <- inner_join(nsfg_resp_df, nsfg_preg_df, by = "caseid", suffix = c("_main", "_preg")) %>%
+  mutate(age_categories = factor(findInterval(ager_main, c( 15 , 35)), labels = c( '15-34' , '35-49'))) 
+
+# ensure age, weights, psu, and stratification variables are the same
+# all(merge_all$vecl_main == merge_all$vecl_main, na.rm = TRUE) 
+# all(merge_all$vest_main == merge_all$vest_main, na.rm = TRUE) 
+# all(merge_all$wgt2022_2023_main == merge_all$wgt2022_2023_main, na.rm = TRUE)
+# all(merge_all$ager_preg == merge_all$ager_main, na.rm = TRUE) 
+# all(merge_all$poverty_preg == merge_all$poverty_main, na.rm = TRUE) 
+# all are true
+
+# df with only women who were pregnant within the last year at the time of survey 
+merge_preg1yr <- merge_all %>%
+  select(caseid, year_interview, datend, ager_main, age_categories, 
+         med_cost_cat, smoke_cat, smoke_curr_cat, race_cat, 
+         poverty_main, poverty_cat, curr_ins_cat, outcome, vecl_main, 
+         vest_main, wgt2022_2023_main) %>%
+  filter(datend >= 2021) %>% # pregnant within the last year
+  filter(!outcome == 6) %>% # removes currently pregnant participants
+  distinct() %>% # remove duplicates
+  mutate(livebirth = ifelse(outcome == 1, 1, 0)) # creates binary outcome for pregnancy
+
+# removing duplicates (multiple outcomes per individual)
+# ranks outcomes: live birth, still birth, miscarriage, abortion, ectopic
+hierarchy <- c(1,3,4,2,5)
+
+# convert to factor with the right ordering
+merge_preg1yr$outcome_factor <- factor(merge_preg1yr$outcome, levels = hierarchy, ordered = TRUE)
+
+# remove the duplicates
+merge_preg1yr <- merge_preg1yr %>%
+  group_by(caseid) %>%
+  arrange(desc(datend)) %>% # most recent year first
+  slice(1) %>% # keep the most recent pregnancy overall
+  ungroup()
+
+# convert to svydesign object
+merge_preg1yr_design <- 
+    svydesign( 
+        id = ~ vecl_main, # specifies the PSU variable
+        strata = ~ vest_main, # specifies stratification variable
+        data = merge_preg1yr, # where data comes from
+        weights = ~ wgt2022_2023_main, # specifies the survey weights
+        nest = TRUE) # tells R that each PSU belongs to 1 strata
+merge_preg1yr_design <- 
+    update(merge_preg1yr_design, 
+        one = 1) # creates new variable, is useful when you want to total rows 
+
+
+# df for table 1 calculations
+merge_nodup_preg <- merge_preg1yr %>%
+  distinct(caseid, .keep_all = TRUE)
+
+
+```
+
+
+Descriptive statistics using srvyr package
+```{r}
+
+# for finding variables
+# test <- nsfg_df %>% select("poverty")
+
+# convert to srvyr object for calculations
+merged_srvyr_design <- as_survey(merge_nodup_preg)
+
+# age groups
+merged_srvyr_design %>%
+  group_by(age_categories) %>%
+  summarize(unweighted_count = unweighted(n())) %>%
+  mutate("percent" = round((unweighted_count / sum(unweighted_count)*100),2))
+
+# number of smokers (current smokers)
+merged_srvyr_design %>%
+  group_by(age_categories) %>%
+  summarize(
+    total = unweighted(n()),
+    number_smoke = unweighted(sum(smoke_curr_cat == "Yes", na.rm = TRUE)))
+
+
+# number of smokers (past smokers)
+merged_srvyr_design %>%
+  group_by(age_categories) %>%
+  summarize(
+    total = unweighted(n()),
+    number_smoke = unweighted(sum(smoke_cat == "Yes", na.rm = TRUE)))
+
+
+# race
+merged_srvyr_design %>%
+  group_by(age_categories) %>%
+  summarize(
+    total = unweighted(n()),
+    number_other = unweighted(sum(race_cat == "Other", na.rm = TRUE)),
+    number_black = unweighted(sum(race_cat == "Black", na.rm = TRUE)),
+    number_white = unweighted(sum(race_cat == "White", na.rm = TRUE)),
+    number_hispanic = unweighted(sum(race_cat == "Hispanic", na.rm = TRUE)))
+
+# poverty
+merged_srvyr_design %>%
+  group_by(age_categories) %>%
+  summarize(
+    total = unweighted(n()),
+    number_below = unweighted(sum(poverty_main <= 200, na.rm = TRUE)),
+    number_above = unweighted(sum(poverty_main >= 201, na.rm = TRUE)))
+
+# med cost
+merged_srvyr_design %>%
+  group_by(age_categories) %>%
+  summarize(
+    total = unweighted(n()),
+    number_refused = unweighted(sum(med_cost_cat == "Yes", na.rm = TRUE)))
+
+
+# health insurance status
+merged_srvyr_design %>%
+  group_by(age_categories) %>%
+  summarize(
+    total = unweighted(n()),
+    number_private = unweighted(sum(curr_ins_cat == "Private", na.rm = TRUE)),
+    number_federal = unweighted(sum(curr_ins_cat == "Federal", na.rm = TRUE)),
+    number_state = unweighted(sum(curr_ins_cat == "State", na.rm = TRUE)),
+    number_limited = unweighted(sum(curr_ins_cat == "Limited", na.rm = TRUE)))
+
+
+
+```
+
+
+Table 1 - this was recoded using chat GPT and visualized in Overleaf
+```{r}
+
+
+table1 <- data.frame(
+  Variable = c('Current Smokers, n (%)', 
+               'Past Smokers, n (%)',
+               'Race', 'Black, n (%)', 'White, n (%)', 'Hispanic, n (%)', 'Other, n (%)', 
+               'Poverty Level', 'Poor, n (%)','Stable, n (%)',
+               'Forgone Care Due to Cost, n (%)',
+               'Health Insurance Type', 'Private, n (%)', 'Federal, n (%)', 'State, n (%)', 'Limited, n (%)'),
+  Total = c('659 (82.4)', 
+            '167 (20.9)',
+            '', '160 (20.0)', '391 (48.9)', '183 (22.9)', '66 (8.2)', 
+            '', '395 (49.4)', '405 (50.6)',
+            '61 (7.6)',
+            '', '411 (51.4)', '57 (7.1)', '259 (32.4)', '73 (9.1)'),
+  `15-34 years` = c('448 (81.5)',
+                    '108 (19.6)',
+                    '', '117 (21.3)', '263 (47.8)', '135 (24.5)', '35 (6.3)', 
+                    '', '302 (54.9)', '248 (45.1)',
+                    '46 (8.4)',
+                    '', '248 (45.1)', '47 (8.5)', '204 (37.1)', '51 (9.3)'),
+  `35-49 years` = c('211 (84.4)',
+                    '59 (23.6)',
+                    '', '43 (1.7)', '128 (51.2)', '48 (19.2)', '31 (12.4)', 
+                    '', '93 (37.2)', '157 (62.8)',
+                    '15 (6.0)',
+                    '', '163 (65.2)', '10 (4.0)', '55 (22.0)', '22 (8.8)'))
+
+# LaTeX formatting
+cat(kable(table1,
+      format = "latex",
+      booktabs = TRUE,
+      col.names = c("Variable", "Total (n = 800)", "15-34 years (n = 550)", "35-49 years (n = 250)"),
+      caption = "Summary Table",
+      align = c("l","l", "l", "l"),
+      escape = TRUE))
+
+```
+
+
+Correlations between categorical variables -> chi squared tests
+```{r}
+
+# variables: med_cost_cat, smoke_cat, smoke_curr_cat, race_cat, poverty_cat, curr_ins_cat
+# chi-squared tests of homogeneity 
+
+# poverty and current insurance
+svychisq(formula = ~poverty_cat + curr_ins_cat, 
+         design = merge_preg1yr_design,
+         statistic = "Chisq")
+# out: p-val is very small, there is a difference
+
+# poverty and med cost
+svychisq(formula = ~poverty_cat + med_cost_cat, 
+         design = merge_preg1yr_design,
+         statistic = "Chisq")
+# out: p-val is big, there is no difference
+
+# poverty and smoking
+svychisq(formula = ~poverty_cat + smoke_curr_cat, 
+         design = merge_preg1yr_design,
+         statistic = "Chisq")
+svychisq(formula = ~poverty_cat + smoke_cat, 
+         design = merge_preg1yr_design,
+         statistic = "Chisq")
+# out: p-val is small, there is a difference
+
+# poverty and race
+svychisq(formula = ~poverty_cat + race_cat, 
+         design = merge_preg1yr_design,
+         statistic = "Chisq")
+# out: p-val is small, there is a difference
+
+
+# from claude
+vars <- c("poverty_cat", "med_cost_cat", "curr_ins_cat", 
+          "race_cat", "smoke_curr_cat", "smoke_cat")
+
+for(var in vars) {
+  formula <- as.formula(paste0("~", "livebirth", "+", var))
+  result <- svychisq(formula, design = merge_preg1yr_design, statistic = "F")
+  cat(var, "×", "livebirth", ": p =", round(result$p.value, 4), "\n")
+}
+
+
+```
+
+
+Correlation plot for categorical data - Claude coded
+```{r}
+
+
+vars <- c("poverty_cat", "med_cost_cat", "curr_ins_cat", 
+          "race_cat", "smoke_curr_cat", "smoke_cat")
+
+# create empty matrix for results
+n_vars <- length(vars)
+cramer_matrix <- matrix(NA, nrow = n_vars, ncol = n_vars,
+                        dimnames = list(vars, vars))
+
+# calculate Cramér's V for each pair
+for(i in 1:n_vars) {
+  for(j in 1:n_vars) {
+    if(i == j) {
+      cramer_matrix[i, j] <- 1  # perfect correlation with itself
+    } else if(i < j) {
+      # create contingency table with survey weights
+      formula <- as.formula(paste0("~", vars[i], "+", vars[j]))
+      contingency <- svytable(formula, design = merge_preg1yr_design)
+      
+      # calculate Cramér's V
+      cramer_matrix[i, j] <- CramerV(contingency)
+      cramer_matrix[j, i] <- cramer_matrix[i, j]  
+    }
+  }
+}
+
+# rename columns and rows for plotting
+new_names <- c("Poverty Level", "Forgone Care", "Health Insurance Type", "Race",
+               "Current Smoker", "Past Smoker")
+
+rownames(cramer_matrix) <- new_names
+colnames(cramer_matrix) <- new_names
+
+
+# saving image
+# png("cramer_corrplot.png", 
+#     width = 2000, height = 2000, res = 300)
+ 
+# Plot the correlation matrix
+corrplot(cramer_matrix, 
+         method = "color",
+         type = "upper",
+         addCoef.col = "black",
+         tl.col = "black",
+         tl.srt = 45,
+         diag = TRUE,
+         number.cex = 0.7,
+         col = colorRampPalette(c("white", "lightblue", "blue"))(100))
+
+# dev.off()
+
+# melt the matrix for ggplot
+cramer_melt <- melt(cramer_matrix)
+
+ggplot(cramer_melt, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(value, 2)), size = 3) +
+  scale_fill_gradient2(low = "white", high = "blue", mid = "lightblue",
+                       midpoint = 0.5, limit = c(0, 1),
+                       name = "Cramér's V") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = "", y = "", title = "Association Matrix for Categorical Variables")
+
+```
+
+
+Histograms/bar plots for each variable - poverty, current insurance, medical cost, race, smokers 
+```{r}
+
+# add the one column
+merge_preg1yr <- merge_preg1yr %>%
+  mutate(one = 1) 
+
+# poverty histogram
+pov_hist <- ggplot(merge_preg1yr, aes(x = poverty_main, weight = wgt2022_2023_main, 
+                      fill = age_categories)) +
+  geom_histogram(aes(y = after_stat(density)), fill = "steelblue", alpha = 0.8, bins = 30) +
+  geom_vline(xintercept = 200, color = 'red', linetype = 'dashed') +
+  facet_wrap(~ age_categories, ncol = 1) +
+  labs(title = "Weighted Distribution of Poverty by Age Group",
+       x = "Poverty Level",
+       y = "Weighted Count") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 20, hjust = 0.5, face = 'bold'),
+        axis.title.x = element_text(size = 18, hjust = 0.5, face = 'bold'),
+        axis.title.y = element_text(size = 18, hjust = 0.5, face = 'bold'),
+        axis.text.y = element_text(size = 16),
+        axis.text.x = element_text(size = 16),
+        strip.text = element_text(size = 18, face = 'bold'))
+
+# ggsave("pov_hist.png", plot = pov_hist, width = 8, height = 10, dpi = 300)
+
+
+# from LADAL but adjusted 
+insurance_type <- merge_preg1yr %>% 
+  ggplot(aes(curr_ins_cat, one, fill = curr_ins_cat)) +
+  labs(x = "Type", y = "Count", title = "Distribution of Health Insurance Type") +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  scale_fill_manual(values = c('#54BFBF','#F2C36B','#54BF9B','#F29B30')) +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 20, hjust = 0.5, face = 'bold'),
+        axis.title.x = element_text(size = 18, hjust = 0.5, face = 'bold'),
+        axis.title.y = element_text(size = 18, hjust = 0.5, face = 'bold'),
+        axis.text.y = element_text(size = 16),
+        axis.text.x = element_text(size = 16)) 
+
+# ggsave("insurance_type.png", plot = insurance_type, width = 12, height = 8, dpi = 300)
+
+
+# med cost
+merge_preg1yr %>% 
+  ggplot(aes(med_cost_cat, one, fill = med_cost_cat)) +
+  labs(x = "", y = "Count", title = "") +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  scale_fill_manual(values = c('#D95970','#54BFBF','#F2C36B','#F29B30')) +
+  theme(legend.position = "none",
+        axis.title = element_text(size = 14, hjust = 0.5, face = 'bold'),
+        axis.title.x = element_text(size = 12, hjust = 0.5),
+        axis.title.y = element_text(size = 12, hjust = 0.5)) 
+
+# race
+merge_preg1yr %>% 
+  ggplot(aes(race_cat, one, fill = race_cat)) +
+  labs(x = "Race", y = "Count", title = "Distribution of Race") +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  scale_fill_manual(values = c('#D95970','#54BFBF','#F2C36B','#F29B30')) +
+  theme(legend.position = "none",
+        axis.title = element_text(size = 14, hjust = 0.5, face = 'bold'),
+        axis.title.x = element_text(size = 12, hjust = 0.5),
+        axis.title.y = element_text(size = 12, hjust = 0.5)) 
+
+# smokers
+merge_preg1yr %>% 
+  ggplot(aes(smoke_cat, one, fill = smoke_cat)) +
+  labs(x = "Whether R Smoked 100 Cigarettes Before", y = "Count", title = "Distribution of Smokers") +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  scale_fill_manual(values = c('#D95970','#54BFBF','#F2C36B','#F29B30')) +
+  theme(legend.position = "none",
+        axis.title = element_text(size = 14, hjust = 0.5, face = 'bold'),
+        axis.title.x = element_text(size = 12, hjust = 0.5),
+        axis.title.y = element_text(size = 12, hjust = 0.5)) 
+
+
+# grouped bar plot - from LADAL and then customized 
+
+# poverty
+merge_preg1yr %>%
+  ggplot(aes(poverty_cat, one,
+    fill = poverty_cat,
+    color = poverty_cat
+  )) +
+  facet_grid(~ age_categories) +
+  geom_bar(stat = "identity") +
+  # geom_line() +
+  labs(x = "Poverty Status", y = "Frequency") +
+  scale_fill_manual(values = c('#D95970','#54BFBF')) +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+
+
+# med cost
+merge_preg1yr %>%
+  ggplot(aes(med_cost_cat, one,
+    fill = med_cost_cat,
+    color = med_cost_cat
+  )) +
+  facet_grid(~ age_categories) +
+  geom_bar(stat = "identity") +
+  # geom_line() +
+  labs(x = "", y = "Frequency") +
+  scale_fill_manual(values = c('#D95970','#54BFBF','#F2C36B','#F29B30')) +
+  scale_color_manual(values = c('#D95970','#54BFBF','#F2C36B','#F29B30')) +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+
+# race by poverty
+merge_preg1yr %>%
+  ggplot(aes(race_cat, one,
+    fill = race_cat,
+    color = race_cat
+  )) +
+  facet_grid(~ poverty_cat) +
+  geom_bar(stat = "identity") +
+  # geom_line() +
+  labs(x = "", y = "Frequency") +
+  scale_fill_manual(values = c('#D95970','#54BFBF','#F2C36B','#F29B30')) +
+  scale_color_manual(values = c('#D95970','#54BFBF','#F2C36B','#F29B30')) +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+
+
+# poverty by smokers
+merge_preg1yr %>%
+  ggplot(aes(smoke_cat, one,
+    fill = smoke_cat,
+    color = smoke_cat
+  )) +
+  facet_grid(~ poverty_cat) +
+  geom_bar(stat = "identity") +
+  # geom_line() +
+  labs(x = "", y = "Frequency") +
+  scale_fill_manual(values = c('#D95970','#54BFBF','#F2C36B','#F29B30')) +
+  scale_color_manual(values = c('#D95970','#54BFBF','#F2C36B','#F29B30')) +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+
+
+# poverty by health ins type
+ins_pov_dist <- merge_preg1yr %>%
+  ggplot(aes(curr_ins_cat, one,
+    fill = curr_ins_cat,
+    color = curr_ins_cat
+  )) +
+  facet_grid(~ poverty_cat) +
+  geom_bar(stat = "identity") +
+  labs(x = "", y = "Frequency", title = "Distribution of Health Insurance Type by Poverty Level") +
+  scale_fill_manual(values = c('#54BFBF','#F2C36B','#54BF9B')) +
+  scale_color_manual(values = c('#54BFBF','#F2C36B','#54BF9B')) +
+  theme_bw() +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 20, hjust = 0.5, face = 'bold'),
+        axis.title.x = element_text(size = 18, hjust = 0.5, face = 'bold'),
+        axis.title.y = element_text(size = 18, hjust = 0.5, face = 'bold'),
+        axis.text.y = element_text(size = 16),
+        axis.text.x = element_text(size = 16), 
+        strip.text = element_text(size = 18, face = 'bold'))
+
+ins_pov_dist
+
+# ggsave("ins_pov_dist.png", plot = ins_pov_dist, width = 12, height = 8, dpi = 300)
+
+
+
+```
+
+
+GLM - from: https://tidy-survey-r.github.io/tidy-survey-book/c07-modeling.html#model-intro
+```{r}
+
+binom_model <- svyglm(design = merge_preg1yr_design,
+                      formula = livebirth ~ poverty_cat + curr_ins_cat + race_cat 
+                      + smoke_curr_cat + med_cost_cat,
+                      family = quasibinomial)
+
+
+tidy(binom_model) %>%
+  mutate(p.value = pretty_p_value(p.value)) %>%
+  gt() %>%
+  fmt_number()
+
+```
+
